@@ -1,0 +1,1208 @@
+--========================================================
+-- 🚁 UAV DRONE + 💣 BOMB + MILITARY FPV + 🔥 IR
+-- TRINHTHIENNHAN // COMPACT VERSION
+--========================================================
+
+local P=game:GetService("Players")
+local UIS=game:GetService("UserInputService")
+local RS=game:GetService("RunService")
+local SS=game:GetService("SoundService")
+local LP=P.LocalPlayer
+local Cam=workspace.CurrentCamera
+
+--========================================================
+-- SETTINGS / STATE
+--========================================================
+
+local SPEED,MIN,MAX=350,50,1500
+local CAMDIST=.25*100
+local SENS=.004
+local THIRD=true
+
+local drone=false
+local bombFlying=false
+local bomb=nil
+local fw,bw,lf,rt=false,false,false,false
+local yaw,pitch=0,0
+local flightStart=0
+local lastPos=nil
+local lastTick=os.clock()
+local maxAlt=0
+
+local thermal=false
+local thermalRange=1800
+local thermalList={}
+
+local IRG=Color3.fromRGB(80,255,120)
+local IRW=Color3.fromRGB(240,255,235)
+local IRR=Color3.fromRGB(255,80,50)
+local GREEN=Color3.fromRGB(100,255,135)
+local DIM=Color3.fromRGB(50,150,75)
+local WHITE=Color3.fromRGB(210,255,220)
+local RED=Color3.fromRGB(255,70,70)
+local AMBER=Color3.fromRGB(255,190,70)
+
+local home=nil
+local homeSet=false
+local sats=12
+local hdop=1.2
+local rssi=-42
+local latency=28
+local mode="MANUAL"
+local fov=90
+local payload="ARMED"
+
+--========================================================
+-- GUI HELPERS
+--========================================================
+
+local GUI=Instance.new("ScreenGui")
+GUI.Name="DroneBombSystem"
+GUI.ResetOnSpawn=false
+GUI.IgnoreGuiInset=true
+GUI.Parent=LP:WaitForChild("PlayerGui")
+
+local function corner(o,r)
+	Instance.new("UICorner",o).CornerRadius=UDim.new(0,r or 10)
+end
+
+local function stroke(o,c,t)
+	local s=Instance.new("UIStroke",o)
+	s.Color=c
+	s.Thickness=t or 1
+	return s
+end
+
+local function label(txt,pos,size,col,parent)
+	local x=Instance.new("TextLabel")
+	x.BackgroundTransparency=1
+	x.Position=pos
+	x.Size=size
+	x.Text=txt
+	x.TextColor3=col or GREEN
+	x.TextSize=13
+	x.Font=Enum.Font.Code
+	x.Parent=parent or HUD
+	return x
+end
+
+local function line(sz,pos,col,parent)
+	local x=Instance.new("Frame")
+	x.Size=sz
+	x.Position=pos
+	x.BackgroundColor3=col or GREEN
+	x.BorderSizePixel=0
+	x.Parent=parent or HUD
+	return x
+end
+
+--========================================================
+-- MENU
+--========================================================
+
+local toggle=Instance.new("TextButton")
+toggle.Size=UDim2.fromOffset(58,58)
+toggle.Position=UDim2.fromOffset(15,15)
+toggle.BackgroundColor3=Color3.fromRGB(12,18,15)
+toggle.Text="✈"
+toggle.TextColor3=Color3.new(1,1,1)
+toggle.TextSize=27
+toggle.Font=Enum.Font.GothamBold
+toggle.AutoButtonColor=false
+toggle.Parent=GUI
+corner(toggle,16)
+
+local menu=Instance.new("Frame")
+menu.Size=UDim2.fromOffset(270,440)
+menu.Position=UDim2.fromOffset(15,85)
+menu.BackgroundColor3=Color3.fromRGB(10,14,12)
+menu.BorderSizePixel=0
+menu.Parent=GUI
+corner(menu,18)
+stroke(menu,IRG,2)
+
+local title=Instance.new("TextLabel")
+title.Size=UDim2.new(1,-20,0,35)
+title.Position=UDim2.fromOffset(10,7)
+title.BackgroundTransparency=1
+title.Text="TRINHTHIENNHAN"
+title.TextColor3=IRG
+title.TextSize=20
+title.Font=Enum.Font.GothamBold
+title.TextXAlignment=Enum.TextXAlignment.Center
+title.Parent=menu
+
+local function drag(o)
+	local active,start,pos
+	o.InputBegan:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.MouseButton1
+		or i.UserInputType==Enum.UserInputType.Touch then
+			active=true
+			start=i.Position
+			pos=o.Position
+			i.Changed:Connect(function()
+				if i.UserInputState==Enum.UserInputState.End then active=false end
+			end)
+		end
+	end)
+	UIS.InputChanged:Connect(function(i)
+		if active and (
+			i.UserInputType==Enum.UserInputType.MouseMovement
+			or i.UserInputType==Enum.UserInputType.Touch) then
+			local d=i.Position-start
+			o.Position=UDim2.new(
+				pos.X.Scale,pos.X.Offset+d.X,
+				pos.Y.Scale,pos.Y.Offset+d.Y
+			)
+		end
+	end)
+end
+
+drag(toggle)
+drag(menu)
+
+local menuVisible=true
+toggle.Activated:Connect(function()
+	menuVisible=not menuVisible
+	menu.Visible=menuVisible
+end)
+
+local function button(txt,y)
+	local b=Instance.new("TextButton")
+	b.Size=UDim2.new(1,-30,0,42)
+	b.Position=UDim2.fromOffset(15,y)
+	b.BackgroundColor3=Color3.fromRGB(22,29,25)
+	b.TextColor3=Color3.fromRGB(220,255,225)
+	b.Text=txt
+	b.TextSize=15
+	b.Font=Enum.Font.GothamBold
+	b.AutoButtonColor=false
+	b.Parent=menu
+	corner(b,12)
+	return b
+end
+
+local bombBtn=button("💣 CHỌN BOM",50)
+local droneBtn=button("🚁 DRONE: TẮT",100)
+local camBtn=button("🎥 GÓC NHÌN: 3D",150)
+local irBtn=button("🔥 IR: TẮT",200)
+local speedDown=button("−",260)
+local speedLbl=button("SPEED "..SPEED,310)
+local speedUp=button("+",360)
+
+--========================================================
+-- HUD
+--========================================================
+
+local HUD=Instance.new("Frame")
+HUD.Size=UDim2.fromScale(1,1)
+HUD.BackgroundTransparency=1
+HUD.Visible=false
+HUD.Parent=GUI
+
+local topL=label(
+	"UAV-01 // FPV DIGITAL",
+	UDim2.fromOffset(28,25),
+	UDim2.fromOffset(280,24)
+)
+
+local topR=label(
+	"MANUAL / STABILIZED",
+	UDim2.new(1,-310,0,25),
+	UDim2.fromOffset(280,24)
+)
+topR.TextXAlignment=Enum.TextXAlignment.Right
+
+local rec=label(
+	"● REC 00:00.0",
+	UDim2.fromOffset(28,52),
+	UDim2.fromOffset(150,22),
+	RED
+)
+
+local gps=label(
+	"GPS 3D LOCK",
+	UDim2.new(1,-300,0,52),
+	UDim2.fromOffset(270,22)
+)
+gps.TextXAlignment=Enum.TextXAlignment.Right
+
+local warn=label(
+	"SYSTEM NORMAL",
+	UDim2.new(.5,-150,0,65),
+	UDim2.fromOffset(300,25)
+)
+warn.TextXAlignment=Enum.TextXAlignment.Center
+
+--========================================================
+-- STATUS BAR
+--========================================================
+
+local status=Instance.new("Frame")
+status.Size=UDim2.fromOffset(680,32)
+status.AnchorPoint=Vector2.new(.5,0)
+status.Position=UDim2.new(.5,0,0,150)
+status.BackgroundColor3=Color3.fromRGB(4,12,7)
+status.BackgroundTransparency=.25
+status.BorderSizePixel=0
+status.Parent=HUD
+stroke(status,DIM,1)
+
+local modeTxt=label("MODE MANUAL",UDim2.fromOffset(10,6),UDim2.fromOffset(115,20),GREEN,status)
+local gpsTxt=label("GPS 12 SAT",UDim2.fromOffset(130,6),UDim2.fromOffset(105,20),GREEN,status)
+local hdopTxt=label("HDOP 1.2",UDim2.fromOffset(240,6),UDim2.fromOffset(90,20),GREEN,status)
+local rssiTxt=label("RSSI -42 dBm",UDim2.fromOffset(335,6),UDim2.fromOffset(115,20),GREEN,status)
+local latTxt=label("LAT 28ms",UDim2.fromOffset(450,6),UDim2.fromOffset(95,20),GREEN,status)
+local payloadTxt=label("PAYLOAD ARMED",UDim2.fromOffset(550,6),UDim2.fromOffset(120,20),GREEN,status)
+
+--========================================================
+-- IR HUD
+--========================================================
+
+local irOverlay=Instance.new("Frame")
+irOverlay.Size=UDim2.fromScale(1,1)
+irOverlay.BackgroundColor3=Color3.fromRGB(30,70,30)
+irOverlay.BackgroundTransparency=.93
+irOverlay.BorderSizePixel=0
+irOverlay.Visible=false
+irOverlay.ZIndex=40
+irOverlay.Parent=HUD
+
+local irTop=label("THERMAL / IR",UDim2.fromOffset(35,92),UDim2.fromOffset(180,25),IRG)
+irTop.ZIndex=50
+
+local irMode=label("FLIR // WHITE-HOT",UDim2.new(1,-240,0,92),UDim2.fromOffset(205,25),IRG)
+irMode.TextXAlignment=Enum.TextXAlignment.Right
+irMode.ZIndex=50
+
+local irTarget=label(
+	"NO THERMAL TARGET",
+	UDim2.new(.5,-150,.5,75),
+	UDim2.fromOffset(300,25),
+	IRG
+)
+irTarget.TextXAlignment=Enum.TextXAlignment.Center
+irTarget.ZIndex=50
+
+local ret=Instance.new("Frame")
+ret.Size=UDim2.fromOffset(150,150)
+ret.AnchorPoint=Vector2.new(.5,.5)
+ret.Position=UDim2.fromScale(.5,.5)
+ret.BackgroundTransparency=1
+ret.ZIndex=51
+ret.Parent=HUD
+corner(ret,75)
+stroke(ret,IRG,2)
+
+for _,v in ipairs({
+	{UDim2.fromOffset(55,2),UDim2.new(.5,-82,.5,0)},
+	{UDim2.fromOffset(55,2),UDim2.new(.5,27,.5,0)},
+	{UDim2.fromOffset(2,55),UDim2.new(.5,0,.5,-82)},
+	{UDim2.fromOffset(2,55),UDim2.new(.5,0,.5,27)}
+}) do
+	local z=line(v[1],v[2],IRG)
+	z.ZIndex=52
+end
+
+local irCenter=label("+",UDim2.new(.5,-15,.5,-17),UDim2.fromOffset(30,30),IRG)
+irCenter.TextXAlignment=Enum.TextXAlignment.Center
+irCenter.ZIndex=53
+
+local irRange=label("RNG ----",UDim2.new(.5,-70,.5,90),UDim2.fromOffset(140,20),IRG)
+irRange.TextXAlignment=Enum.TextXAlignment.Center
+irRange.ZIndex=50
+
+--========================================================
+-- COMPASS / HORIZON
+--========================================================
+
+local compass=Instance.new("Frame")
+compass.Size=UDim2.fromOffset(600,48)
+compass.AnchorPoint=Vector2.new(.5,.5)
+compass.Position=UDim2.new(.5,0,0,205)
+compass.BackgroundColor3=Color3.fromRGB(4,12,7)
+compass.BackgroundTransparency=.25
+compass.BorderColor3=DIM
+compass.ClipsDescendants=true
+compass.Parent=HUD
+
+local compassTxt=label(
+	"330   000   030   060   090   120   150",
+	UDim2.fromScale(0,0),
+	UDim2.fromScale(1,1),
+	WHITE,
+	compass
+)
+compassTxt.TextXAlignment=Enum.TextXAlignment.Center
+compassTxt.TextYAlignment=Enum.TextYAlignment.Center
+
+local pointer=label("▲",UDim2.new(.5,-20,0,5),UDim2.fromOffset(40,30),GREEN,compass)
+pointer.TextXAlignment=Enum.TextXAlignment.Center
+
+local horizon=Instance.new("Frame")
+horizon.Size=UDim2.fromOffset(650,380)
+horizon.AnchorPoint=Vector2.new(.5,.5)
+horizon.Position=UDim2.fromScale(.5,.5)
+horizon.BackgroundTransparency=1
+horizon.ClipsDescendants=true
+horizon.Parent=HUD
+
+local hLine=line(UDim2.fromOffset(760,2),UDim2.new(.5,-380,.5,0),DIM,horizon)
+local cLine=line(UDim2.fromOffset(190,3),UDim2.new(.5,-95,.5,0),GREEN,horizon)
+local ladder={}
+
+for d=-30,30,5 do
+	if d~=0 then
+		local w=d%10==0 and 100 or 55
+		local l=line(UDim2.fromOffset(w,2),UDim2.new(.5,-w/2,.5,d*5),DIM,horizon)
+		local n=label(tostring(math.abs(d)),UDim2.new(.5,-w/2-35,.5,d*5-9),UDim2.fromOffset(30,18),DIM,horizon)
+		ladder[#ladder+1]={line=l,label=n,deg=d,w=w}
+	end
+end
+
+local fpv=Instance.new("Frame")
+fpv.Size=UDim2.fromOffset(32,32)
+fpv.AnchorPoint=Vector2.new(.5,.5)
+fpv.Position=UDim2.fromScale(.5,.5)
+fpv.BackgroundTransparency=1
+fpv.Parent=HUD
+corner(fpv,16)
+stroke(fpv,GREEN,2)
+
+--========================================================
+-- ALTITUDE DATA, PANEL HIDDEN
+--========================================================
+
+local altPanel=Instance.new("Frame")
+altPanel.Size=UDim2.fromOffset(150,275)
+altPanel.Position=UDim2.fromOffset(25,285)
+altPanel.Visible=false
+altPanel.Parent=HUD
+
+local alt=label("0000",UDim2.fromOffset(8,65),UDim2.fromOffset(134,50),WHITE,altPanel)
+alt.TextSize=29
+local maxAltTxt=label("MAX 0000",UDim2.fromOffset(8,150),UDim2.fromOffset(134,20),GREEN,altPanel)
+local vsTxt=label("V/S +000",UDim2.fromOffset(8,178),UDim2.fromOffset(134,20),GREEN,altPanel)
+local aglTxt=label("AGL LOCK",UDim2.fromOffset(8,210),UDim2.fromOffset(134,20),GREEN,altPanel)
+
+--========================================================
+-- AIRSPEED
+--========================================================
+
+local air=Instance.new("Frame")
+air.Size=UDim2.fromOffset(150,275)
+air.Position=UDim2.new(1,-175,.5,-125)
+air.BackgroundColor3=Color3.fromRGB(4,12,7)
+air.BackgroundTransparency=.25
+air.BorderColor3=DIM
+air.Parent=HUD
+
+local airBig=label("000",UDim2.fromOffset(8,65),UDim2.fromOffset(134,50),WHITE,air)
+airBig.TextSize=29
+local ground=label("GS 000",UDim2.fromOffset(8,150),UDim2.fromOffset(134,20),GREEN,air)
+local wind=label("WIND --",UDim2.fromOffset(8,178),UDim2.fromOffset(134,20),GREEN,air)
+local fovTxt=label("FOV 90°",UDim2.fromOffset(8,210),UDim2.fromOffset(134,20),GREEN,air)
+
+--========================================================
+-- ATTITUDE / NAV
+--========================================================
+
+local roll=Instance.new("Frame")
+roll.Size=UDim2.fromOffset(330,65)
+roll.AnchorPoint=Vector2.new(.5,.5)
+roll.Position=UDim2.new(.5,0,.5,-170)
+roll.BackgroundTransparency=1
+roll.Parent=HUD
+
+for i=-6,6 do
+	line(
+		UDim2.fromOffset(i%3==0 and 3 or 1,i%3==0 and 20 or 10),
+		UDim2.new(.5,i*25,.5,-5),
+		GREEN,
+		roll
+	)
+end
+
+local rollPointer=label("▼",UDim2.new(.5,-20,.5,10),UDim2.fromOffset(40,25),GREEN,roll)
+rollPointer.TextXAlignment=Enum.TextXAlignment.Center
+
+local nav=Instance.new("Frame")
+nav.Size=UDim2.fromOffset(230,125)
+nav.Position=UDim2.new(1,-255,1,-225)
+nav.BackgroundColor3=Color3.fromRGB(4,12,7)
+nav.BackgroundTransparency=.25
+nav.BorderColor3=DIM
+nav.Parent=HUD
+
+local homeDist=label("HOME ----",UDim2.fromOffset(10,34),UDim2.fromOffset(210,20),GREEN,nav)
+homeDist.TextXAlignment=Enum.TextXAlignment.Center
+local homeBrg=label("BRG ----°",UDim2.fromOffset(10,58),UDim2.fromOffset(210,20),GREEN,nav)
+homeBrg.TextXAlignment=Enum.TextXAlignment.Center
+local homeArrow=label("HOME ▲",UDim2.fromOffset(10,84),UDim2.fromOffset(210,25),WHITE,nav)
+homeArrow.TextXAlignment=Enum.TextXAlignment.Center
+
+local coords=label(
+	"X +000.0 | Y +000.0 | Z +000.0",
+	UDim2.new(.5,-300,1,-145),
+	UDim2.fromOffset(600,22),
+	DIM
+)
+coords.TextXAlignment=Enum.TextXAlignment.Center
+
+local teleL=label(
+	"ROLL +00°\nPITCH +00°\nYAW 000°\nACC 000",
+	UDim2.fromOffset(30,585),
+	UDim2.fromOffset(180,90),
+	DIM
+)
+
+local teleR=label(
+	"CAM 3D\nFOV 90°\nHDG 000°\nLINK OK",
+	UDim2.new(1,-210,0,585),
+	UDim2.fromOffset(180,90),
+	DIM
+)
+teleR.TextXAlignment=Enum.TextXAlignment.Right
+
+local bottom=label(
+	"BAT 100% | SIGNAL 100% | LINK STABLE | IMU OK",
+	UDim2.new(.5,-300,1,-65),
+	UDim2.fromOffset(600,28),
+	GREEN
+)
+bottom.TextXAlignment=Enum.TextXAlignment.Center
+
+local flightStatus=label(
+	"FLIGHT CONTROL: ACTIVE",
+	UDim2.new(.5,-150,1,-105),
+	UDim2.fromOffset(300,25),
+	GREEN
+)
+flightStatus.TextXAlignment=Enum.TextXAlignment.Center
+
+local mainMsg=label(
+	"UAV FPV // SYSTEM READY",
+	UDim2.new(.5,-180,1,-35),
+	UDim2.fromOffset(360,25),
+	GREEN
+)
+mainMsg.TextXAlignment=Enum.TextXAlignment.Center
+
+--========================================================
+-- MOBILE CONTROLS
+--========================================================
+
+local controls=Instance.new("Frame")
+controls.Size=UDim2.fromOffset(270,190)
+controls.Position=UDim2.new(0,65,1,-215)
+controls.BackgroundTransparency=1
+controls.Visible=false
+controls.Parent=GUI
+
+local function moveBtn(txt,pos)
+	local b=Instance.new("TextButton")
+	b.Size=UDim2.fromOffset(58,58)
+	b.Position=pos
+	b.BackgroundColor3=Color3.fromRGB(18,25,21)
+	b.Text=txt
+	b.TextColor3=WHITE
+	b.TextSize=25
+	b.Font=Enum.Font.GothamBold
+	b.AutoButtonColor=false
+	b.Parent=controls
+	corner(b,14)
+	stroke(b,GREEN,1).Transparency=.45
+	return b
+end
+
+local up=moveBtn("▲",UDim2.fromOffset(72,0))
+local down=moveBtn("▼",UDim2.fromOffset(72,70))
+local leftBtn=moveBtn("◀",UDim2.fromOffset(0,70))
+local rightBtn=moveBtn("▶",UDim2.fromOffset(144,70))
+
+local function bind(b,n)
+	b.InputBegan:Connect(function(i)
+		if not drone then return end
+		if i.UserInputType==Enum.UserInputType.Touch
+		or i.UserInputType==Enum.UserInputType.MouseButton1 then
+			if n=="f" then fw=true elseif n=="b" then bw=true
+			elseif n=="l" then lf=true elseif n=="r" then rt=true end
+		end
+	end)
+	b.InputEnded:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.Touch
+		or i.UserInputType==Enum.UserInputType.MouseButton1 then
+			if n=="f" then fw=false elseif n=="b" then bw=false
+			elseif n=="l" then lf=false elseif n=="r" then rt=false end
+		end
+	end)
+end
+
+bind(up,"f")
+bind(down,"b")
+bind(leftBtn,"l")
+bind(rightBtn,"r")
+
+--========================================================
+-- SOUND
+--========================================================
+
+local sound=Instance.new("Sound")
+sound.Name="DroneEngine"
+sound.SoundId="rbxassetid://9118828562"
+sound.Looped=true
+sound.Volume=.5
+sound.Parent=SS
+
+--========================================================
+-- PHYSICS
+--========================================================
+
+local attachment,velocity,orientation
+
+local function clearPhysics()
+	if velocity then velocity:Destroy() velocity=nil end
+	if orientation then orientation:Destroy() orientation=nil end
+	if attachment then attachment:Destroy() attachment=nil end
+end
+
+local function setupPhysics(part)
+	clearPhysics()
+
+	attachment=Instance.new("Attachment",part)
+
+	velocity=Instance.new("LinearVelocity")
+	velocity.Attachment0=attachment
+	velocity.MaxForce=math.huge
+	velocity.VectorVelocity=Vector3.zero
+	velocity.Parent=part
+
+	orientation=Instance.new("AlignOrientation")
+	orientation.Attachment0=attachment
+	orientation.MaxTorque=math.huge
+	orientation.Responsiveness=200
+	orientation.Parent=part
+end
+
+--========================================================
+-- CAMERA
+--========================================================
+
+local function readAngles()
+	local l=Cam.CFrame.LookVector
+	yaw=math.atan2(-l.X,-l.Z)
+	pitch=math.asin(math.clamp(l.Y,-1,1))
+end
+
+local function lookVector()
+	return CFrame.fromOrientation(pitch,yaw,0).LookVector
+end
+
+--========================================================
+-- FIND BOMB
+--========================================================
+
+local function findBomb()
+	local origin=Cam.CFrame.Position
+	local dir=Cam.CFrame.LookVector*1500
+
+	local rp=RaycastParams.new()
+	rp.FilterType=Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances={LP.Character}
+
+	local hit=workspace:Raycast(origin,dir,rp)
+	if not hit then return nil end
+
+	local obj=hit.Instance
+
+	for _=1,8 do
+		if not obj then break end
+		local n=obj.Name:lower()
+
+		if n:find("bomb") or n:find("bom") then
+			if obj:IsA("BasePart") then return obj end
+			local p=obj:FindFirstChildWhichIsA("BasePart",true)
+			if p then return p end
+		end
+
+		obj=obj.Parent
+	end
+
+	return nil
+end
+
+bombBtn.Activated:Connect(function()
+	if drone then return end
+
+	local b=findBomb()
+	bomb=b
+
+	if b then
+		bombBtn.Text="💣 BOM ĐÃ CHỌN"
+	else
+		bombBtn.Text="💣 KHÔNG THẤY BOM"
+	end
+
+	task.delay(1,function()
+		if not drone then bombBtn.Text="💣 CHỌN BOM" end
+	end)
+end)
+
+--========================================================
+-- THERMAL
+--========================================================
+
+local function clearThermal()
+	for _,h in pairs(thermalList) do
+		if h then h:Destroy() end
+	end
+	table.clear(thermalList)
+end
+
+local function addThermal(plr)
+	if plr==LP or not plr.Character or thermalList[plr] then return end
+
+	local c=plr.Character
+	local root=c:FindFirstChild("HumanoidRootPart")
+	local hum=c:FindFirstChildOfClass("Humanoid")
+
+	if not root or not hum or hum.Health<=0 then return end
+
+	local h=Instance.new("Highlight")
+	h.Name="IR_THERMAL_TARGET"
+	h.Adornee=c
+	h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+	h.FillColor=IRR
+	h.OutlineColor=IRW
+	h.FillTransparency=.35
+	h.OutlineTransparency=.05
+	h.Parent=c
+
+	thermalList[plr]=h
+end
+
+local function updateThermal()
+	if not thermal or not drone then
+		clearThermal()
+		return
+	end
+
+	local origin=Cam.CFrame.Position
+	local closest,closestD=nil,math.huge
+
+	for _,plr in ipairs(P:GetPlayers()) do
+		if plr~=LP and plr.Character then
+			local root=plr.Character:FindFirstChild("HumanoidRootPart")
+			local hum=plr.Character:FindFirstChildOfClass("Humanoid")
+
+			if root and hum and hum.Health>0 then
+				local d=(root.Position-origin).Magnitude
+
+				if d<=thermalRange then
+					addThermal(plr)
+
+					local sp,on=Cam:WorldToViewportPoint(root.Position)
+					if on then
+						local c=Vector2.new(Cam.ViewportSize.X/2,Cam.ViewportSize.Y/2)
+						local p=Vector2.new(sp.X,sp.Y)
+						local sd=(p-c).Magnitude
+
+						if sd<closestD then
+							closestD=sd
+							closest={p=plr,d=d}
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for plr,h in pairs(thermalList) do
+		if not plr.Character then
+			h:Destroy()
+			thermalList[plr]=nil
+		else
+			local r=plr.Character:FindFirstChild("HumanoidRootPart")
+			if not r or (r.Position-origin).Magnitude>thermalRange then
+				h:Destroy()
+				thermalList[plr]=nil
+			end
+		end
+	end
+
+	if closest then
+		irTarget.Text="THERMAL: "..closest.p.DisplayName:upper()
+		irTarget.TextColor3=IRR
+		irRange.Text=string.format("RNG %04d STUDS",math.floor(closest.d))
+	else
+		irTarget.Text="NO THERMAL TARGET"
+		irTarget.TextColor3=IRG
+		irRange.Text="RNG ----"
+	end
+end
+
+local function updateIR()
+	irBtn.Text=thermal and "🔥 IR: BẬT" or "🔥 IR: TẮT"
+	irOverlay.Visible=thermal and drone
+end
+
+irBtn.Activated:Connect(function()
+	if not drone then return end
+	thermal=not thermal
+	if not thermal then clearThermal() end
+	updateIR()
+end)
+
+--========================================================
+-- START / STOP
+--========================================================
+
+local function stopDrone()
+	drone=false
+	bombFlying=false
+	fw=false
+	bw=false
+	lf=false
+	rt=false
+
+	clearPhysics()
+	clearThermal()
+
+	thermal=false
+	bomb=nil
+
+	HUD.Visible=false
+	controls.Visible=false
+	irOverlay.Visible=false
+
+	if sound.IsPlaying then sound:Stop() end
+
+	Cam.CameraType=Enum.CameraType.Custom
+
+	droneBtn.Text="🚁 DRONE: TẮT"
+	bombBtn.Text="💣 CHỌN BOM"
+	irBtn.Text="🔥 IR: TẮT"
+
+	lastPos=nil
+	flightStart=0
+	maxAlt=0
+	home=nil
+	homeSet=false
+end
+
+local function startDrone()
+	if not bomb then bomb=findBomb() end
+
+	if not bomb then
+		droneBtn.Text="🚁 CHƯA CHỌN BOM"
+		task.delay(1,function()
+			if not drone then droneBtn.Text="🚁 DRONE: TẮT" end
+		end)
+		return
+	end
+
+	readAngles()
+	setupPhysics(bomb)
+
+	drone=true
+	bombFlying=true
+
+	-- IR tự động bật
+	thermal=true
+
+	flightStart=os.clock()
+	lastPos=bomb.Position
+	lastTick=os.clock()
+	maxAlt=bomb.Position.Y
+
+	home=bomb.Position
+	homeSet=true
+
+	Cam.CameraType=Enum.CameraType.Scriptable
+
+	droneBtn.Text="🚁 DRONE: BẬT"
+	HUD.Visible=true
+	controls.Visible=true
+
+	updateIR()
+
+	if not sound.IsPlaying then sound:Play() end
+end
+
+droneBtn.Activated:Connect(function()
+	if drone then stopDrone() else startDrone() end
+end)
+
+--========================================================
+-- CAMERA MODE / SPEED
+--========================================================
+
+local function updateCam()
+	camBtn.Text=THIRD and "🎥 GÓC NHÌN: 3D" or "🎥 GÓC NHÌN: FPV"
+end
+
+camBtn.Activated:Connect(function()
+	THIRD=not THIRD
+	updateCam()
+end)
+
+local function updateSpeed()
+	speedLbl.Text="SPEED "..SPEED
+end
+
+speedDown.Activated:Connect(function()
+	SPEED=math.max(MIN,SPEED-50)
+	updateSpeed()
+end)
+
+speedUp.Activated:Connect(function()
+	SPEED=math.min(MAX,SPEED+50)
+	updateSpeed()
+end)
+
+--========================================================
+-- FREE CAMERA
+--========================================================
+
+local camTouch,lastTouch
+
+local function controlUI(o)
+	return o:IsDescendantOf(menu)
+		or o:IsDescendantOf(controls)
+		or o==toggle
+end
+
+UIS.InputBegan:Connect(function(i)
+	if not drone then return end
+
+	if i.UserInputType==Enum.UserInputType.Touch then
+		local p=i.Position
+
+		for _,o in ipairs(GUI:GetGuiObjectsAtPosition(p.X,p.Y)) do
+			if controlUI(o) then return end
+		end
+
+		camTouch=i
+		lastTouch=p
+
+	elseif i.UserInputType==Enum.UserInputType.MouseButton2 then
+		camTouch=i
+		lastTouch=i.Position
+	end
+end)
+
+UIS.InputChanged:Connect(function(i)
+	if not drone or i~=camTouch then return end
+
+	local p=i.Position
+	local d=p-lastTouch
+	lastTouch=p
+
+	yaw-=d.X*SENS
+	pitch-=d.Y*SENS
+	pitch=math.clamp(pitch,math.rad(-85),math.rad(85))
+end)
+
+UIS.InputEnded:Connect(function(i)
+	if i==camTouch then
+		camTouch=nil
+		lastTouch=nil
+	end
+end)
+
+--========================================================
+-- KEYBOARD
+--========================================================
+
+UIS.InputBegan:Connect(function(i,gp)
+	if gp then return end
+
+	local k=i.KeyCode
+
+	if k==Enum.KeyCode.F then
+		if drone then stopDrone() else startDrone() end
+
+	elseif k==Enum.KeyCode.V then
+		THIRD=not THIRD
+		updateCam()
+
+	elseif k==Enum.KeyCode.T and drone then
+		thermal=not thermal
+		if not thermal then clearThermal() end
+		updateIR()
+
+	elseif k==Enum.KeyCode.W then fw=true
+	elseif k==Enum.KeyCode.S then bw=true
+	elseif k==Enum.KeyCode.A then lf=true
+	elseif k==Enum.KeyCode.D then rt=true
+
+	elseif k==Enum.KeyCode.Q then
+		SPEED=math.max(MIN,SPEED-50)
+		updateSpeed()
+
+	elseif k==Enum.KeyCode.E then
+		SPEED=math.min(MAX,SPEED+50)
+		updateSpeed()
+	end
+end)
+
+UIS.InputEnded:Connect(function(i)
+	if i.KeyCode==Enum.KeyCode.W then fw=false
+	elseif i.KeyCode==Enum.KeyCode.S then bw=false
+	elseif i.KeyCode==Enum.KeyCode.A then lf=false
+	elseif i.KeyCode==Enum.KeyCode.D then rt=false
+	end
+end)
+
+--========================================================
+-- HUD UPDATE
+--========================================================
+
+local function updateHUD(head,pitchDeg,altitude,speed,climb,pos)
+	local runtime=os.clock()-flightStart
+
+	rec.Text=string.format("● REC %05.1fs",runtime)
+	gps.Text=string.format(
+		"GPS %02d SAT // LOCK %03d%%",
+		sats,
+		math.clamp(100-math.abs(pitchDeg)*.15,82,100)
+	)
+
+	modeTxt.Text="MODE "..mode
+	gpsTxt.Text=string.format("GPS %02d SAT",sats)
+	hdopTxt.Text=string.format("HDOP %.1f",hdop)
+	rssiTxt.Text=string.format("RSSI %d dBm",rssi)
+	latTxt.Text=string.format("LAT %dms",latency)
+	payloadTxt.Text="PAYLOAD "..payload
+
+	if math.abs(pitchDeg)>70 then
+		warn.Text="⚠ HIGH PITCH"
+		warn.TextColor3=RED
+		flightStatus.Text="FLIGHT WARNING"
+		flightStatus.TextColor3=RED
+
+	elseif speed>MAX*.9 then
+		warn.Text="⚠ HIGH AIRSPEED"
+		warn.TextColor3=RED
+		flightStatus.Text="SPEED LIMIT"
+		flightStatus.TextColor3=RED
+
+	elseif altitude<10 then
+		warn.Text="⚠ LOW ALTITUDE"
+		warn.TextColor3=AMBER
+		flightStatus.Text="LOW ALTITUDE"
+		flightStatus.TextColor3=AMBER
+
+	else
+		warn.Text="SYSTEM NORMAL"
+		warn.TextColor3=GREEN
+		flightStatus.Text="FLIGHT CONTROL: ACTIVE"
+		flightStatus.TextColor3=GREEN
+	end
+
+	local off=math.clamp(pitchDeg,-30,30)*5
+
+	hLine.Position=UDim2.new(.5,-380,.5,off)
+	cLine.Position=UDim2.new(.5,-95,.5,off)
+
+	for _,v in ipairs(ladder) do
+		local y=off+v.deg*5
+		v.line.Position=UDim2.new(.5,-v.w/2,.5,y)
+		v.label.Position=UDim2.new(.5,-v.w/2-35,.5,y-9)
+	end
+
+	head=math.floor(head)%360
+
+	local h={
+		(head+330)%360,
+		head,
+		(head+30)%360,
+		(head+60)%360,
+		(head+90)%360,
+		(head+120)%360,
+		(head+150)%360
+	}
+
+	compassTxt.Text=string.format(
+		"%03d   %03d   %03d   %03d   %03d   %03d   %03d",
+		h[1],h[2],h[3],h[4],h[5],h[6],h[7]
+	)
+
+	pointer.Text=
+		head<45 and "N"
+		or head<135 and "E"
+		or head<225 and "S"
+		or head<315 and "W"
+		or "N"
+
+	alt.Text=string.format("%04d",math.max(0,math.floor(altitude)))
+	maxAltTxt.Text=string.format("MAX %04d",math.floor(maxAlt))
+	vsTxt.Text=string.format("V/S %+04d",math.floor(climb))
+
+	airBig.Text=string.format("%03d",math.floor(speed))
+	ground.Text=string.format("GS %03d",math.floor(speed))
+	fovTxt.Text=string.format("FOV %d°",fov)
+
+	local px=math.clamp(yaw/math.pi,-.45,.45)
+	local py=math.clamp(-pitchDeg/90,-.38,.38)
+
+	fpv.Position=UDim2.new(.5,px*300,.5,py*220)
+
+	teleL.Text=string.format(
+		"ROLL +00°\nPITCH %+03d°\nYAW %03d°\nACC %03d",
+		math.floor(pitchDeg),
+		math.floor(head),
+		math.floor(speed)
+	)
+
+	teleR.Text=string.format(
+		"CAM %s\nFOV %d°\nHDG %03d°\nLINK OK",
+		THIRD and "3D" or "FPV",
+		fov,
+		math.floor(head)
+	)
+
+	local battery=math.clamp(100-runtime/120,65,100)
+	local signal=math.clamp(100-math.abs(pitchDeg)*.15,82,100)
+
+	bottom.Text=string.format(
+		"BAT %03d%% | SIGNAL %03d%% | LINK STABLE | IMU OK",
+		battery,
+		signal
+	)
+
+	if homeSet and home then
+		local delta=home-pos
+		local dist=delta.Magnitude
+
+		local bearing=math.deg(math.atan2(delta.X,-delta.Z))
+		if bearing<0 then bearing+=360 end
+
+		local rel=(bearing-head+360)%360
+
+		homeDist.Text=string.format(
+			"HOME %04d STUDS",
+			math.floor(dist)
+		)
+
+		homeBrg.Text=string.format(
+			"BRG %03d°",
+			math.floor(bearing)
+		)
+
+		local arrow=
+			rel<22.5 or rel>337.5 and "▲"
+			or rel<67.5 and "↗"
+			or rel<112.5 and "→"
+			or rel<157.5 and "↘"
+			or rel<202.5 and "▼"
+			or rel<247.5 and "↙"
+			or rel<292.5 and "←"
+			or "↖"
+
+		homeArrow.Text="HOME "..arrow
+	end
+
+	coords.Text=string.format(
+		"X %+07.1f | Y %+07.1f | Z %+07.1f",
+		pos.X,pos.Y,pos.Z
+	)
+
+	if thermal then updateThermal() end
+end
+
+--========================================================
+-- MAIN FLIGHT LOOP
+--========================================================
+
+RS.RenderStepped:Connect(function()
+	if not drone or not bombFlying or not bomb then
+		HUD.Visible=false
+		controls.Visible=false
+		clearThermal()
+		return
+	end
+
+	if not bomb.Parent then
+		stopDrone()
+		return
+	end
+
+	HUD.Visible=true
+	controls.Visible=true
+
+	local look=lookVector()
+	local cf=CFrame.lookAt(Vector3.zero,look)
+	local right=cf.RightVector
+	local dir=Vector3.zero
+
+	if fw then dir+=look end
+	if bw then dir-=look end
+	if lf then dir-=right end
+	if rt then dir+=right end
+
+	if dir.Magnitude>0 then dir=dir.Unit end
+
+	if velocity then
+		velocity.VectorVelocity=dir*SPEED
+	end
+
+	if orientation and dir.Magnitude>0 then
+		orientation.CFrame=CFrame.lookAt(Vector3.zero,dir)
+	end
+
+	Cam.CameraType=Enum.CameraType.Scriptable
+
+	if THIRD then
+		local cp=bomb.Position-look*CAMDIST+Vector3.new(0,6,0)
+		Cam.CFrame=CFrame.lookAt(cp,cp+look)
+	else
+		Cam.CFrame=CFrame.lookAt(
+			bomb.Position,
+			bomb.Position+look
+		)
+	end
+
+	local now=os.clock()
+	local dt=math.max(now-lastTick,.001)
+	local pos=bomb.Position
+	local altitude=pos.Y
+
+	maxAlt=math.max(maxAlt,altitude)
+
+	local speed=0
+	if lastPos then
+		speed=(pos-lastPos).Magnitude/dt
+	end
+
+	lastPos=pos
+	lastTick=now
+
+	local heading=math.deg(math.atan2(-look.X,-look.Z))
+	if heading<0 then heading+=360 end
+
+	local pitchDeg=math.deg(pitch)
+	local climb=look.Y*SPEED
+
+	updateHUD(
+		heading,
+		pitchDeg,
+		altitude,
+		speed,
+		climb,
+		pos
+	)
+end)
+
+--========================================================
+-- RESPAWN
+--========================================================
+
+LP.CharacterAdded:Connect(function()
+	stopDrone()
+	task.wait(.5)
+	Cam.CameraType=Enum.CameraType.Custom
+end)
+
+updateCam()
+updateSpeed()
